@@ -4,6 +4,7 @@ import std/math
 
 const Gravity* = 9.80665
 var gravity = Gravity
+var damping = 0.1
 var previousTime, currentTime = float32(getMonoTime().ticks()/1000000000)
 var frameTime: float32
 var elapsedTime: float32
@@ -22,8 +23,7 @@ proc normalize*(v: var Vector2) =
 proc normalized*(v: Vector2): Vector2 =
   result = v
   result.normalize()
-
-
+  
 
 proc zero*(T: typedesc[Vector2]): Vector2 =
   Vector2(x: 0, y: 0)
@@ -124,7 +124,7 @@ type Body* = ref object
   bodyShape*: BodyShape
   radius*: float32
   size*: Vector2
-  mass: float32
+  mass*: float32
   inverseMass: float32
   force: Vector2
   position*: Vector2
@@ -135,8 +135,8 @@ type Body* = ref object
   gravityScale*: float32
   isColliding*: bool
   damping: float32
-  area: float32
-  dragCoefficient: float32
+  dampingValue: float32
+  isGrounded*: bool
 
 var bodies: seq[Body] = @[]
 
@@ -150,14 +150,7 @@ proc newBody*(bodyType: BodyType = dynamicBody, bodyShape: BodyShape = rectangle
   else:
     gravityScale = 0.0
 
-  var area: float32
-  var dragCoefficient: float32
-  if bodyShape == rectangle:
-    area = size.x * size.y
-    dragCoefficient = 1.05
-  elif bodyShape == circle:
-    area = PI * radius * radius
-    dragCoefficient = 0.47
+  let dampingValue = exp(-damping * dt)
 
   let body = Body(
     bodyType: bodyType,
@@ -169,17 +162,24 @@ proc newBody*(bodyType: BodyType = dynamicBody, bodyShape: BodyShape = rectangle
     manualForce: manualForce,
     gravityScale: gravityScale,
     inverseMass: inverseMass,
-    damping: 0.1,
-    area: area
+    damping: damping,
+    dampingValue: dampingValue,
   )
   bodies.add(body)
   return body
 
 proc setPhysicsHz*(hz: int) =
   dt = 1/hz
+  for body in bodies:
+    body.dampingValue = exp(-damping * dt)
 
 proc getPhysicsHz*(): int =
   int(round(1 / dt))
+
+proc setDamping*(body: Body, newDamping: float32) =
+  body.damping = newDamping
+  for body in bodies:
+    body.dampingValue = exp(-newDamping * dt)
 
 proc applyForce*(body: Body, force: Vector2) =
   body.manualForce += force
@@ -235,7 +235,7 @@ proc updateVelocity() =
       body.velocity += body.acceleration * dt
       body.velocity += body.manualImpulse * body.inverseMass
       body.manualImpulse = Vector2.zero
-      body.velocity *= exp(-body.damping * dt)
+      body.velocity *= body.dampingValue
 
 proc updatePosition() =
   for body in bodies:
@@ -250,30 +250,63 @@ proc updateAll() =
 
 proc resolveAabb*(a, b: Body) =
   var body: Body
+  var other: Body
+
   if a.bodyType != staticBody:
     body = a
+    other = b
   elif b.bodyType != staticBody:
     body = b
+    other = a
+  else:
+    return
 
   let overlapX = min(a.right(), b.right()) - max(a.left(), b.left())
   let overlapY = min(a.bottom(), b.bottom()) - max(a.top(), b.top())
 
+  if overlapX > overlapY:
+    if body.position.y < other.position.y:
+      if body.velocity.y >= 0:
+        body.isGrounded = true
+        body.velocity.y = 0
+    elif body.position.y > other.position.y:
+      if other.velocity.y >= 0:
+        other.isGrounded = true
+        other.velocity.y = 0
+
+  if a.bodyType != staticBody and b.bodyType != staticBody:
+    let totalInverseMass = a.inverseMass + b.inverseMass
+    let aPercent = a.inverseMass / totalInverseMass
+    let bPercent = b.inverseMass / totalInverseMass
+    if overlapX < overlapY:
+      if a.position.x < b.position.x:
+        a.position.x -= overlapX * aPercent
+        b.position.x += overlapX * bPercent
+      else:
+        a.position.x += overlapX * aPercent
+        b.position.x -= overlapX * bPercent
+    else:
+      if a.position.y < b.position.y:
+        a.position.y -= overlapY * aPercent
+        b.position.y += overlapY * bPercent
+      else:
+        a.position.y += overlapY * aPercent
+        b.position.y -= overlapY * bPercent
+    return
+
   if overlapX < overlapY:
-    if body.position.x < b.position.x:
+    if body.position.x < other.position.x:
         body.position.x -= overlapX
     else:
         body.position.x += overlapX
   else:
-      if body.position.y < b.position.y:
+      if body.position.y < other.position.y:
           body.position.y -= overlapY
       else:
           body.position.y += overlapY
 
-      
-proc aabb() =
-  for body in bodies:
-    body.isColliding = false
 
+proc aabb() =
   for i in 0 ..< bodies.high:
     let a = bodies[i]
     if a.bodyShape != rectangle: continue
@@ -287,7 +320,11 @@ proc aabb() =
           resolveAabb(a, b)
 
 proc checkCollisions() =
-  aabb()
+  for body in bodies:
+    body.isColliding = false
+    body.isGrounded = false
+  for i in 0..<16:
+    aabb()
 
 proc updatePhysics*() =
   currentTime = float32(getMonoTime().ticks()/1000000000)
